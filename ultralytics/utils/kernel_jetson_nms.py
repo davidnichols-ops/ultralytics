@@ -143,6 +143,10 @@ at::Tensor nms(at::Tensor boxes, double iou_threshold) {
     }
     return keep.narrow(0, 0, keep_count).clone();
 }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("nms", &nms, "Jetson Nano NMS (CUDA)");
+}
 """
 
 
@@ -156,9 +160,9 @@ def _compile_jetson_nms():
 
     return load_inline(
         name="jetson_nms",
-        cpp_sources=["at::Tensor nms(at::Tensor boxes, double iou_threshold);"],
+        cpp_sources=[""],  # no C++ source needed; PYBIND11_MODULE is in the CUDA source
         cuda_sources=[_CUDA_NMS_SOURCE],
-        functions=["nms"],
+        functions=None,  # don't auto-generate binding — we provide PYBIND11_MODULE in the CUDA source
         verbose=False,
     )
 

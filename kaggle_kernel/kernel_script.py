@@ -10,6 +10,7 @@ This script:
 """
 
 import json
+import os
 import time
 
 import torch
@@ -105,6 +106,10 @@ at::Tensor nms(at::Tensor boxes, double iou_threshold) {
     }
     return keep.narrow(0, 0, keep_count).clone();
 }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("nms", &nms, "Jetson Nano NMS (CUDA)");
+}
 """
 
 
@@ -182,11 +187,18 @@ def main():
 
     global _compiled_module
     t0 = time.perf_counter()
+    # Clear stale build cache to avoid corrupted .so from previous failed attempts
+    import shutil
+
+    cache_dir = os.path.expanduser("~/.cache/torch_extensions")
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
     _compiled_module = load_inline(
         name="jetson_nms",
-        cpp_sources=["at::Tensor nms(at::Tensor boxes, double iou_threshold);"],
+        cpp_sources=[""],
         cuda_sources=[CUDA_NMS_SOURCE],
-        functions=["nms"],
+        functions=None,  # PYBIND11_MODULE is in the CUDA source
         verbose=True,
     )
     compile_time = time.perf_counter() - t0
@@ -209,7 +221,12 @@ def main():
     test_cases = [
         ("no overlaps", [[0, 0, 10, 10], [20, 20, 30, 30], [50, 50, 60, 60]], [0.9, 0.8, 0.7], 0.5),
         ("all overlapping", [[0, 0, 10, 10], [0, 0, 10, 10], [0, 0, 10, 10]], [0.9, 0.8, 0.7], 0.5),
-        ("partial overlap", [[0, 0, 10, 10], [1, 1, 11, 11], [20, 20, 30, 30], [50, 50, 60, 60], [2, 2, 12, 12]], [0.9, 0.8, 0.7, 0.6, 0.5], 0.5),
+        (
+            "partial overlap",
+            [[0, 0, 10, 10], [1, 1, 11, 11], [20, 20, 30, 30], [50, 50, 60, 60], [2, 2, 12, 12]],
+            [0.9, 0.8, 0.7, 0.6, 0.5],
+            0.5,
+        ),
         ("high threshold", [[0, 0, 10, 10], [0, 0, 9, 9], [0, 0, 8, 8]], [0.9, 0.8, 0.7], 0.7),
         ("low threshold", [[0, 0, 10, 10], [0, 0, 9, 9], [0, 0, 8, 8]], [0.9, 0.8, 0.7], 0.3),
         ("empty", [], [], 0.5),
@@ -287,7 +304,9 @@ def main():
             }
             tv_str = f"{t_tv:.4f}ms" if t_tv is not None else "N/A"
             speedup = (t_tv / t_jetson if t_tv and t_jetson > 0 else 0) if t_tv else 0
-            print(f"  {label:10s}  torchvision={tv_str:>10s}  jetson={t_jetson:.4f}ms  torch_fb={t_torch:.4f}ms  speedup={speedup:.2f}x")
+            print(
+                f"  {label:10s}  torchvision={tv_str:>10s}  jetson={t_jetson:.4f}ms  torch_fb={t_torch:.4f}ms  speedup={speedup:.2f}x"
+            )
     else:
         print("\n--- Latency benchmark skipped (GPU incompatible with installed PyTorch) ---")
 

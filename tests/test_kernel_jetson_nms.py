@@ -58,9 +58,10 @@ def _cpu_caps():
 
 
 def test_cuda_source_contains_nms_kernel():
-    """The embedded CUDA source defines the nms_kernel and the host wrapper function."""
+    """The embedded CUDA source defines the nms_kernel, host wrapper, and pybind binding."""
     assert "nms_kernel" in _CUDA_NMS_SOURCE
-    assert "at::Tensor nms(" in _CUDA_NMS_SOURCE  # host wrapper named `nms` for load_inline auto-binding
+    assert "at::Tensor nms(" in _CUDA_NMS_SOURCE  # host wrapper
+    assert "PYBIND11_MODULE" in _CUDA_NMS_SOURCE  # self-contained binding (no auto-generation)
     assert "extern __shared__" in _CUDA_NMS_SOURCE  # shared-memory single-block design
 
 
