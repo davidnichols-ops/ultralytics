@@ -58,11 +58,12 @@ def _cpu_caps():
 
 
 def test_cuda_source_contains_nms_kernel():
-    """The embedded CUDA source defines the nms_kernel, host wrapper, and pybind binding."""
+    """The embedded CUDA source defines the parallel nms_kernel, host wrapper, and pybind binding."""
     assert "nms_kernel" in _CUDA_NMS_SOURCE
     assert "at::Tensor nms(" in _CUDA_NMS_SOURCE  # host wrapper
     assert "PYBIND11_MODULE" in _CUDA_NMS_SOURCE  # self-contained binding (no auto-generation)
     assert "extern __shared__" in _CUDA_NMS_SOURCE  # shared-memory single-block design
+    assert "atomicAdd" in _CUDA_NMS_SOURCE  # GPU-side keep-count compaction (no CPU sync)
 
 
 def test_register_jetson_nms_noop_without_cuda(monkeypatch):

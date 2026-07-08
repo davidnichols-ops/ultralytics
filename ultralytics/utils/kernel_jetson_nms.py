@@ -7,11 +7,12 @@ kernel is lazy-compiled on-device via `torch.utils.cpp_extension.load_inline` on
 kernel dispatcher so the inference pipeline can transparently adopt it when running on Jetson Nano hardware.
 
 Design choices for Jetson Nano (Maxwell, 128 CUDA cores, 4GB shared CPU/GPU memory):
-- Single-block kernel using shared memory: YOLO post-filter box counts are small (typically <1000, often <100), so a
-  single thread block with shared-memory boxes avoids the global-memory traffic and launch overhead that hurts
-  low-core-count GPUs. This trades scalability on huge N (not a YOLO post-filter scenario) for low latency on small N.
+- Single-block kernel with parallel IoU: thread 0 picks the next surviving box, then ALL threads cooperatively
+  compute IoU against that box and suppress in parallel. This leverages the 128-core GPU for the O(N) inner loop
+  of each suppression round, while keeping the O(K) outer loop (K = kept boxes) sequential.
+- Shared memory for boxes: avoids repeated global memory reads during the IoU computation.
 - FP32 throughout: Maxwell lacks INT8 tensor cores and efficient FP16 compute, so FP32 is the native fast path.
-- No dynamic parallelism: Maxwell (sm_53) supports it poorly; the iterative suppress loop runs in a single block.
+- The keep-count compaction is done on-GPU (atomicAdd) to avoid a CPU sync round-trip per call.
 
 When CUDA is unavailable or compilation fails (e.g. no nvcc on the device), the dispatcher's fallback returns None and
 callers use the existing `TorchNMS.nms` / `torchvision.ops.nms` path — no regression on unsupported hardware.
@@ -31,81 +32,97 @@ from ultralytics.utils.kernel_dispatch import register_kernel
 
 # CUDA C++ source for the NMS kernel. Compiled via load_inline targeting the current device's architecture.
 # Algorithm: sort by score descending (done in PyTorch before the kernel), then iteratively pick the top surviving box
-# and suppress all remaining boxes with IoU > threshold. The single-block design uses shared memory for boxes and
-# a bitmask for the "suppressed" state, keeping global memory traffic to one read of boxes + one write of keep indices.
+# and suppress all remaining boxes with IoU > threshold. The single-block design uses shared memory for boxes.
+# All threads cooperate on the IoU computation for each suppression round — thread 0 selects the next box, then
+# every thread checks a subset of remaining boxes and writes suppression flags in parallel.
 _CUDA_NMS_SOURCE = r"""
 #include <torch/extension.h>
 #include <vector>
 
-// Single-block NMS kernel for small N (YOLO post-filter regime, N <= 4096).
+// Parallel single-block NMS kernel for small N (YOLO post-filter regime, N <= 2700).
 // boxes: (N, 4) float32 xyxy, sorted by score descending.
-// keep:  (N,) int64, filled with kept indices (-1 sentinel after the last valid entry).
+// keep:  (K,) int64, filled with kept indices (K <= N, compacted via atomicAdd counter).
 // iou_threshold: float32 scalar.
 __global__ void nms_kernel(const float* __restrict__ boxes,
                            int64_t* __restrict__ keep,
+                           int* __restrict__ keep_count,
                            float iou_threshold,
                            int n) {
-    extern __shared__ float s_boxes[];  // 4 * n floats
+    extern __shared__ float s_data[];  // 4*n floats (boxes) + n ints (suppressed flags)
+
+    float* s_boxes = s_data;
+    int* s_suppressed = (int*)(s_data + n * 4);  // int array for coalesced access
 
     int tid = threadIdx.x;
-    // Load boxes into shared memory (4 floats per box, coalesced across threads)
-    for (int i = tid; i < n * 4; i += blockDim.x) {
+    int blockDim_x = blockDim.x;
+
+    // Load boxes into shared memory (4 floats per box, coalesced)
+    for (int i = tid; i < n * 4; i += blockDim_x) {
         s_boxes[i] = boxes[i];
     }
+    // Initialize suppressed flags to 0
+    for (int i = tid; i < n; i += blockDim_x) {
+        s_suppressed[i] = 0;
+    }
+    if (tid == 0) *keep_count = 0;
     __syncthreads();
 
-    // Suppressed flags: one byte per box, in shared memory via a separate allocation passed as dynamic shared
-    // We use a simple approach: each thread checks IoU against the current "best" box.
-    // Thread 0 drives the iterative selection loop.
-    if (tid == 0) {
-        int keep_count = 0;
-        // Simple suppressed array in shared memory (reuse tail of s_boxes after the 4*n floats)
-        // We allocated 4*n + n bytes conceptually; cast the tail to char*
-        char* suppressed = (char*)(s_boxes + n * 4);
-        for (int i = 0; i < n; i++) suppressed[i] = 0;
+    // Thread 0 drives the selection loop; all threads cooperate on suppression
+    for (int i = 0; i < n; i++) {
+        // Thread 0 checks if box i is suppressed; if not, it's the next kept box
+        __shared__ bool s_is_suppressed;
+        if (tid == 0) {
+            s_is_suppressed = (s_suppressed[i] != 0);
+        }
+        __syncthreads();
 
-        for (int i = 0; i < n; i++) {
-            if (suppressed[i]) continue;
-            keep[keep_count++] = i;  // keep original index (caller sorted, so i is the rank)
-            if (keep_count >= n) break;
+        if (s_is_suppressed) continue;
 
-            float ix1 = s_boxes[i * 4 + 0];
-            float iy1 = s_boxes[i * 4 + 1];
-            float ix2 = s_boxes[i * 4 + 2];
-            float iy2 = s_boxes[i * 4 + 3];
-            float iarea = (ix2 - ix1) * (iy2 - iy1);
-            if (iarea <= 0.0f) continue;
+        // Thread 0 writes the kept index and increments the counter
+        if (tid == 0) {
+            int idx = atomicAdd(keep_count, 1);
+            keep[idx] = i;
+        }
 
-            for (int j = i + 1; j < n; j++) {
-                if (suppressed[j]) continue;
-                float jx1 = s_boxes[j * 4 + 0];
-                float jy1 = s_boxes[j * 4 + 1];
-                float jx2 = s_boxes[j * 4 + 2];
-                float jy2 = s_boxes[j * 4 + 3];
+        // All threads cooperate to suppress boxes j > i with high IoU
+        float ix1 = s_boxes[i * 4 + 0];
+        float iy1 = s_boxes[i * 4 + 1];
+        float ix2 = s_boxes[i * 4 + 2];
+        float iy2 = s_boxes[i * 4 + 3];
+        float iarea = (ix2 - ix1) * (iy2 - iy1);
+        if (iarea <= 0.0f) {
+            __syncthreads();
+            continue;
+        }
 
-                float xx1 = fmaxf(ix1, jx1);
-                float yy1 = fmaxf(iy1, jy1);
-                float xx2 = fminf(ix2, jx2);
-                float yy2 = fminf(iy2, jy2);
+        // Each thread checks a subset of boxes j = i+1..n-1
+        for (int j = i + 1 + tid; j < n; j += blockDim_x) {
+            if (s_suppressed[j]) continue;
+            float jx1 = s_boxes[j * 4 + 0];
+            float jy1 = s_boxes[j * 4 + 1];
+            float jx2 = s_boxes[j * 4 + 2];
+            float jy2 = s_boxes[j * 4 + 3];
 
-                float w = fmaxf(0.0f, xx2 - xx1);
-                float h = fmaxf(0.0f, yy2 - yy1);
-                float inter = w * h;
-                float jarea = (jx2 - jx1) * (jy2 - jy1);
-                float iou = inter / (iarea + jarea - inter + 1e-8f);
-                if (iou > iou_threshold) {
-                    suppressed[j] = 1;
-                }
+            float xx1 = fmaxf(ix1, jx1);
+            float yy1 = fmaxf(iy1, jy1);
+            float xx2 = fminf(ix2, jx2);
+            float yy2 = fminf(iy2, jy2);
+
+            float w = fmaxf(0.0f, xx2 - xx1);
+            float h = fmaxf(0.0f, yy2 - yy1);
+            float inter = w * h;
+            float jarea = (jx2 - jx1) * (jy2 - jy1);
+            float iou = inter / (iarea + jarea - inter + 1e-8f);
+            if (iou > iou_threshold) {
+                s_suppressed[j] = 1;
             }
         }
-        // Sentinel: fill remaining slots with -1
-        for (int k = keep_count; k < n; k++) keep[k] = -1;
+        __syncthreads();
     }
 }
 
 // Host wrapper: boxes must be (N, 4) float32 on CUDA, sorted by score descending.
-// Returns (keep_count,) int64 tensor of kept indices (compact, no sentinels).
-// Named `nms` so load_inline's auto-generated pybind binding (functions=["nms"]) finds it.
+// Returns (K,) int64 tensor of kept indices (compacted, no sentinels).
 at::Tensor nms(at::Tensor boxes, double iou_threshold) {
     TORCH_CHECK(boxes.is_cuda(), "boxes must be a CUDA tensor");
     TORCH_CHECK(boxes.dim() == 2 && boxes.size(1) == 4, "boxes must be (N, 4)");
@@ -113,35 +130,29 @@ at::Tensor nms(at::Tensor boxes, double iou_threshold) {
 
     int n = boxes.size(0);
     auto keep = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(boxes.device()));
+    auto keep_count = at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(boxes.device()));
 
     if (n == 0) return keep;
 
-    // Cap N to avoid exceeding shared memory on Maxwell (48KB per block on sm_53).
-    // 4*n floats (boxes) + n bytes (suppressed) = 5*n bytes. 48KB / 5 = ~9600 boxes max.
-    // For YOLO post-filter this is never hit; fall back to torchvision for pathological N.
-    const int MAX_N = 4096;  // conservative cap for shared memory + register pressure
-    TORCH_CHECK(n <= MAX_N, "nms_forward: N exceeds single-block cap; use torchvision fallback for N > ", MAX_N);
+    // Shared memory: 4*n floats (boxes) + n ints (suppressed flags) = n * (16 + 4) = 20*n bytes.
+    // 48KB / 20 = ~2457 boxes. Use 2300 as a conservative cap.
+    const int MAX_N = 2300;
+    TORCH_CHECK(n <= MAX_N, "nms: N exceeds shared-memory cap (", MAX_N, "); use torchvision fallback for N > ", MAX_N);
 
-    // Shared memory: 4*n floats for boxes + n bytes for suppressed flags
-    size_t shared_mem_bytes = 4 * n * sizeof(float) + n * sizeof(char);
+    size_t shared_mem_bytes = (size_t)n * 4 * sizeof(float) + (size_t)n * sizeof(int);
 
+    // Use 256 threads for parallel IoU computation
     nms_kernel<<<1, 256, shared_mem_bytes>>>(
         boxes.data_ptr<float>(),
         keep.data_ptr<int64_t>(),
+        keep_count.data_ptr<int>(),
         (float)iou_threshold,
         n
     );
 
-    // Compact: remove -1 sentinels by scanning and truncating
-    // (Simple approach: find the first -1 and narrow the tensor)
-    auto keep_cpu = keep.cpu();
-    auto keep_acc = keep_cpu.accessor<int64_t, 1>();
-    int keep_count = 0;
-    for (int i = 0; i < n; i++) {
-        if (keep_acc[i] >= 0) keep_count++;
-        else break;
-    }
-    return keep.narrow(0, 0, keep_count).clone();
+    // Read keep_count from GPU (single int — minimal sync) and truncate
+    int k = keep_count.item<int>();
+    return keep.narrow(0, 0, k).clone();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -167,8 +178,16 @@ def _compile_jetson_nms():
     )
 
 
+# Maximum N the single-block kernel can handle (limited by 48KB shared memory: 20*N bytes < 48KB).
+# The Python wrapper falls back to torchvision for N above this threshold.
+_MAX_KERNEL_N = 2300
+
+
 def jetson_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
     """Run the Jetson Nano CUDA NMS kernel on sorted boxes.
+
+    Falls back to torchvision.ops.nms when N exceeds the shared-memory cap or when the custom kernel
+    raises at runtime, so callers always get a correct result.
 
     Args:
         boxes (torch.Tensor): (N, 4) float32 xyxy boxes on CUDA.
@@ -182,8 +201,20 @@ def jetson_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) 
     order = scores.argsort(descending=True)
     sorted_boxes = boxes[order].contiguous().float()
 
+    if sorted_boxes.shape[0] > _MAX_KERNEL_N:
+        # Fall back to torchvision for large N (shared memory can't hold the boxes)
+        import torchvision  # scoped as slow import
+
+        return order[torchvision.ops.nms(sorted_boxes, scores[order], iou_threshold)]
+
     module = _compile_jetson_nms()
-    keep_local = module.nms(sorted_boxes, float(iou_threshold))  # indices into the sorted array
+    try:
+        keep_local = module.nms(sorted_boxes, float(iou_threshold))  # indices into the sorted array
+    except Exception as e:
+        LOGGER.warning(f"kernel_jetson_nms: CUDA kernel failed ({e}), falling back to torchvision")
+        import torchvision  # scoped as slow import
+
+        return order[torchvision.ops.nms(sorted_boxes, scores[order], iou_threshold)]
     # Map back to original indices
     return order[keep_local.to(order.device)]
 

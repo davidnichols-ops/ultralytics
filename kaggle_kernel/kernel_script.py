@@ -20,58 +20,61 @@ CUDA_NMS_SOURCE = r"""
 #include <torch/extension.h>
 #include <vector>
 
+// Parallel single-block NMS kernel: all threads cooperate on IoU computation.
 __global__ void nms_kernel(const float* __restrict__ boxes,
                            int64_t* __restrict__ keep,
+                           int* __restrict__ keep_count,
                            float iou_threshold,
                            int n) {
-    extern __shared__ float s_boxes[];
+    extern __shared__ float s_data[];
+    float* s_boxes = s_data;
+    int* s_suppressed = (int*)(s_data + n * 4);
 
     int tid = threadIdx.x;
-    for (int i = tid; i < n * 4; i += blockDim.x) {
-        s_boxes[i] = boxes[i];
-    }
+    int blockDim_x = blockDim.x;
+
+    for (int i = tid; i < n * 4; i += blockDim_x) s_boxes[i] = boxes[i];
+    for (int i = tid; i < n; i += blockDim_x) s_suppressed[i] = 0;
+    if (tid == 0) *keep_count = 0;
     __syncthreads();
 
-    if (tid == 0) {
-        int keep_count = 0;
-        char* suppressed = (char*)(s_boxes + n * 4);
-        for (int i = 0; i < n; i++) suppressed[i] = 0;
+    for (int i = 0; i < n; i++) {
+        __shared__ bool s_is_suppressed;
+        if (tid == 0) s_is_suppressed = (s_suppressed[i] != 0);
+        __syncthreads();
+        if (s_is_suppressed) continue;
 
-        for (int i = 0; i < n; i++) {
-            if (suppressed[i]) continue;
-            keep[keep_count++] = i;
-            if (keep_count >= n) break;
-
-            float ix1 = s_boxes[i * 4 + 0];
-            float iy1 = s_boxes[i * 4 + 1];
-            float ix2 = s_boxes[i * 4 + 2];
-            float iy2 = s_boxes[i * 4 + 3];
-            float iarea = (ix2 - ix1) * (iy2 - iy1);
-            if (iarea <= 0.0f) continue;
-
-            for (int j = i + 1; j < n; j++) {
-                if (suppressed[j]) continue;
-                float jx1 = s_boxes[j * 4 + 0];
-                float jy1 = s_boxes[j * 4 + 1];
-                float jx2 = s_boxes[j * 4 + 2];
-                float jy2 = s_boxes[j * 4 + 3];
-
-                float xx1 = fmaxf(ix1, jx1);
-                float yy1 = fmaxf(iy1, jy1);
-                float xx2 = fminf(ix2, jx2);
-                float yy2 = fminf(iy2, jy2);
-
-                float w = fmaxf(0.0f, xx2 - xx1);
-                float h = fmaxf(0.0f, yy2 - yy1);
-                float inter = w * h;
-                float jarea = (jx2 - jx1) * (jy2 - jy1);
-                float iou = inter / (iarea + jarea - inter + 1e-8f);
-                if (iou > iou_threshold) {
-                    suppressed[j] = 1;
-                }
-            }
+        if (tid == 0) {
+            int idx = atomicAdd(keep_count, 1);
+            keep[idx] = i;
         }
-        for (int k = keep_count; k < n; k++) keep[k] = -1;
+
+        float ix1 = s_boxes[i * 4 + 0];
+        float iy1 = s_boxes[i * 4 + 1];
+        float ix2 = s_boxes[i * 4 + 2];
+        float iy2 = s_boxes[i * 4 + 3];
+        float iarea = (ix2 - ix1) * (iy2 - iy1);
+        if (iarea <= 0.0f) { __syncthreads(); continue; }
+
+        for (int j = i + 1 + tid; j < n; j += blockDim_x) {
+            if (s_suppressed[j]) continue;
+            float jx1 = s_boxes[j * 4 + 0];
+            float jy1 = s_boxes[j * 4 + 1];
+            float jx2 = s_boxes[j * 4 + 2];
+            float jy2 = s_boxes[j * 4 + 3];
+
+            float xx1 = fmaxf(ix1, jx1);
+            float yy1 = fmaxf(iy1, jy1);
+            float xx2 = fminf(ix2, jx2);
+            float yy2 = fminf(iy2, jy2);
+            float w = fmaxf(0.0f, xx2 - xx1);
+            float h = fmaxf(0.0f, yy2 - yy1);
+            float inter = w * h;
+            float jarea = (jx2 - jx1) * (jy2 - jy1);
+            float iou = inter / (iarea + jarea - inter + 1e-8f);
+            if (iou > iou_threshold) s_suppressed[j] = 1;
+        }
+        __syncthreads();
     }
 }
 
@@ -82,29 +85,24 @@ at::Tensor nms(at::Tensor boxes, double iou_threshold) {
 
     int n = boxes.size(0);
     auto keep = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(boxes.device()));
+    auto keep_count = at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(boxes.device()));
 
     if (n == 0) return keep;
 
-    const int MAX_N = 4096;
-    TORCH_CHECK(n <= MAX_N, "N exceeds single-block cap; use torchvision fallback for N > ", MAX_N);
+    const int MAX_N = 2300;
+    TORCH_CHECK(n <= MAX_N, "nms: N exceeds shared-memory cap (", MAX_N, "); use torchvision fallback for N > ", MAX_N);
 
-    size_t shared_mem_bytes = 4 * n * sizeof(float) + n * sizeof(char);
-
+    size_t shared_mem_bytes = (size_t)n * 4 * sizeof(float) + (size_t)n * sizeof(int);
     nms_kernel<<<1, 256, shared_mem_bytes>>>(
         boxes.data_ptr<float>(),
         keep.data_ptr<int64_t>(),
+        keep_count.data_ptr<int>(),
         (float)iou_threshold,
         n
     );
 
-    auto keep_cpu = keep.cpu();
-    auto keep_acc = keep_cpu.accessor<int64_t, 1>();
-    int keep_count = 0;
-    for (int i = 0; i < n; i++) {
-        if (keep_acc[i] >= 0) keep_count++;
-        else break;
-    }
-    return keep.narrow(0, 0, keep_count).clone();
+    int k = keep_count.item<int>();
+    return keep.narrow(0, 0, k).clone();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -113,11 +111,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 
+_MAX_KERNEL_N = 2300
+
+
 def jetson_nms(boxes, scores, iou_threshold):
-    """Wrapper: sort by score, call CUDA kernel, map indices back."""
+    """Wrapper: sort by score, call CUDA kernel, map indices back. Falls back to torchvision for large N."""
     order = scores.argsort(descending=True)
     sorted_boxes = boxes[order].contiguous().float()
-    keep_local = _compiled_module.nms(sorted_boxes, float(iou_threshold))
+
+    if sorted_boxes.shape[0] > _MAX_KERNEL_N:
+        return order[torchvision.ops.nms(sorted_boxes, scores[order], iou_threshold)]
+
+    try:
+        keep_local = _compiled_module.nms(sorted_boxes, float(iou_threshold))
+    except Exception as e:
+        print(f"  jetson_nms: kernel failed ({e}), falling back to torchvision")
+        return order[torchvision.ops.nms(sorted_boxes, scores[order], iou_threshold)]
     return order[keep_local.to(order.device)]
 
 
@@ -287,7 +296,15 @@ def main():
     results = {}
     if cuda_ops_work:
         print("\n--- Latency benchmark (median of 50 runs, ms) ---")
-        bench_configs = [("N=10", 10), ("N=50", 50), ("N=100", 100), ("N=300", 300), ("N=1000", 1000), ("N=3000", 3000)]
+        bench_configs = [
+            ("N=10", 10),
+            ("N=50", 50),
+            ("N=100", 100),
+            ("N=300", 300),
+            ("N=1000", 1000),
+            ("N=2000", 2000),  # within kernel range (MAX_N=2700)
+            ("N=3000", 3000),  # exceeds cap — wrapper falls back to torchvision
+        ]
         for label, n in bench_configs:
             torch.manual_seed(42)
             boxes = torch.rand(n, 4, device="cuda") * 640
